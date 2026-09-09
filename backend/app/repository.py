@@ -21,8 +21,8 @@ class ReportRepository:
         self,
         *,
         company_name: str,
-        sections: dict[str, Any | None],
-        section_sources: dict[str, list[dict[str, str]]],
+        sections: dict[str, Any],
+        section_sources: dict[str, list[dict[str, Any]]],
         warnings: list[str],
     ) -> Report:
         record = ReportRecord(

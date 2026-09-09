@@ -1,0 +1,99 @@
+@import 'tailwindcss';
+
+/*
+ * Warm slate with an amber accent. One light theme on purpose — the brief
+ * lists dark mode as out of scope, and a single well-tuned palette is easier
+ * to keep consistent than two half-tuned ones.
+ */
+@theme {
+  --color-canvas: #faf8f5;
+  --color-surface: #ffffff;
+  --color-raised: #f5f1ea;
+  --color-ink: #1c1917;
+  --color-ink-soft: #44403c;
+  --color-muted: #79716b;
+  --color-line: #eae3d9;
+  --color-line-strong: #d9cfc1;
+  --color-brand: #b45309;
+  --color-brand-strong: #8a3f07;
+  --color-brand-soft: #fdf1de;
+  --color-positive: #15803d;
+  --color-positive-soft: #eaf6ee;
+  --color-danger: #b3261e;
+  --color-danger-soft: #fdeceb;
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --shadow-panel: 0 1px 2px rgba(28, 25, 23, 0.04), 0 12px 32px rgba(28, 25, 23, 0.06);
+  --shadow-raised: 0 1px 2px rgba(28, 25, 23, 0.06), 0 2px 6px rgba(28, 25, 23, 0.04);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* A caret that trails streaming text, so "still writing" is unmistakable. */
+  .streaming-caret::after {
+    content: '';
+    display: inline-block;
+    width: 0.5ch;
+    height: 1em;
+    margin-left: 0.15em;
+    vertical-align: -0.15em;
+    background-color: var(--color-brand);
+    animation: caret-blink 1s steps(2, start) infinite;
+  }
+
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      var(--color-raised) 0%,
+      #ece6dd 50%,
+      var(--color-raised) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

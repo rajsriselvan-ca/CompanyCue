@@ -4,10 +4,7 @@
 !.env.example
 *.pem
 *.key
-*.p12
-*.pfx
 credentials.json
-service-account*.json
 
 # Python
 .venv/
@@ -18,27 +15,17 @@ __pycache__/
 
 # Node
 node_modules/
-frontend/.next/
 frontend/dist/
-frontend/.vinext/
-frontend/.wrangler/
-frontend/coverage/
 *.tsbuildinfo
 
 # Runtime data
 *.db
 *.db-shm
 *.db-wal
-*.sqlite
-*.sqlite3
-*.sqlite-shm
-*.sqlite-wal
+*.sqlite*
 
-# Local tooling and OS files
+# OS and editors
 .DS_Store
-tmp/
 *.log
-.*/
-!/.github/
-/Briefd/
-*.zip
+.idea/
+.vscode/

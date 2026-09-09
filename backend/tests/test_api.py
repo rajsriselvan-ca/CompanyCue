@@ -1,261 +1,187 @@
+"""HTTP surface: status codes, the SSE contract, persistence, duplicate locking."""
+
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
-from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
 from app.main import create_app
-from app.schemas import SectionKey, Source
-from app.services.provider import (
-    ProviderEvent,
-    ProviderProgress,
-    ProviderQuotaError,
-    ProviderResult,
-    ResearchProviderError,
-)
-
-
-SECTION_DATA: dict[SectionKey, dict[str, Any]] = {
-    "overview": {"overview": "Test Company builds verified testing tools."},
-    "key_people": {"key_people": [{"name": "Test Person", "title": "CEO"}]},
-    "news": {
-        "news": [
-            {
-                "headline": "Test Company releases a test product",
-                "summary": "A deterministic fixture used only by the automated test suite.",
-                "date": "2026-09-01",
-            }
-        ]
-    },
-    "financials": {
-        "financials": {
-            "revenue": None,
-            "employee_count": None,
-            "market_cap": None,
-            "yoy_growth": None,
-        }
-    },
-    "risks": {
-        "risks": [
-            {
-                "title": "Fixture risk",
-                "details": "This deterministic item verifies rendering and persistence behavior.",
-            }
-        ]
-    },
-}
-
-
-class FakeResearchProvider:
-    def __init__(self, failing_section: SectionKey | None = None) -> None:
-        self.failing_section = failing_section
-
-    async def stream_section(
-        self, company_name: str, section: SectionKey
-    ) -> AsyncIterator[ProviderEvent]:
-        if section == self.failing_section:
-            raise ResearchProviderError("The test provider could not load this section.", retryable=True)
-        yield ProviderProgress(received_characters=120)
-        yield ProviderResult(
-            data=SECTION_DATA[section],
-            sources=[Source(title=f"{company_name} source", url="https://example.com/source")],
-        )
-
-
-class QuotaLimitedProvider:
-    def __init__(self) -> None:
-        self.calls: list[SectionKey] = []
-
-    async def stream_section(
-        self, company_name: str, section: SectionKey
-    ) -> AsyncIterator[ProviderEvent]:
-        self.calls.append(section)
-        raise ProviderQuotaError("The configured test key has no available quota.")
-        yield  # pragma: no cover - keeps this method an async generator
-
-
-class RetryOnceProvider(FakeResearchProvider):
-    def __init__(self) -> None:
-        super().__init__()
-        self.attempts: dict[SectionKey, int] = {}
-
-    async def stream_section(
-        self, company_name: str, section: SectionKey
-    ) -> AsyncIterator[ProviderEvent]:
-        self.attempts[section] = self.attempts.get(section, 0) + 1
-        if section == "overview" and self.attempts[section] == 1:
-            raise ProviderQuotaError("Temporary test limit.", retryable=True)
-        async for event in super().stream_section(company_name, section):
-            yield event
-
-
-class LateQuotaProvider(FakeResearchProvider):
-    async def stream_section(
-        self, company_name: str, section: SectionKey
-    ) -> AsyncIterator[ProviderEvent]:
-        if section == "financials":
-            raise ProviderQuotaError("Temporary test limit.", retryable=True)
-        async for event in super().stream_section(company_name, section):
-            yield event
-
-
-def parse_sse(body: str) -> list[tuple[str, dict[str, Any]]]:
-    parsed: list[tuple[str, dict[str, Any]]] = []
-    for block in body.strip().split("\n\n"):
-        fields = dict(
-            line.split(": ", 1)
-            for line in block.splitlines()
-            if ": " in line
-        )
-        parsed.append((fields["event"], json.loads(fields["data"])))
-    return parsed
+from app.research import ActiveResearchRegistry
 
 
 @pytest.fixture
-def client(tmp_path: Any) -> TestClient:
-    settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'briefd-test.db'}",
-        gemini_api_key=None,
-    )
-    with TestClient(create_app(settings=settings, provider=FakeResearchProvider())) as test_client:
+def client(settings, runtime):
+    # TestClient runs the lifespan, so the database and agent runtime are real.
+    with TestClient(create_app(settings=settings, runtime=runtime)) as test_client:
         yield test_client
 
 
-def test_health_reports_provider_configuration(client: TestClient) -> None:
+def parse_sse(text: str) -> list[dict]:
+    """Decode a whole SSE body into (event, data) pairs, ignoring heartbeats."""
+    events = []
+    for block in text.split("\n\n"):
+        if not block.strip() or block.lstrip().startswith(":"):
+            continue
+        name, data = None, []
+        for line in block.split("\n"):
+            if line.startswith("event: "):
+                name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data.append(line.removeprefix("data: "))
+        if name and data:
+            events.append({"event": name, "data": json.loads("\n".join(data))})
+    return events
+
+
+def research(client: TestClient, company: str):
+    with client.stream("POST", "/api/research", json={"company_name": company}) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["cache-control"] == "no-cache, no-transform"
+        return parse_sse(response.read().decode())
+
+
+def test_health_reports_the_configured_providers(client):
     response = client.get("/api/health")
-
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "gemini_configured": False}
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["search_provider"] == "serpapi"
+    assert body["llm_provider"].startswith("groq:")
+    assert body["mock_mode"] is True
 
 
-def test_research_streams_in_order_and_persists_report(client: TestClient) -> None:
-    response = client.post("/api/research", json={"company_name": "Test Company"})
-
+def test_reports_list_is_empty_before_any_research(client):
+    response = client.get("/api/reports")
     assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    events = parse_sse(response.text)
-    names = [name for name, _ in events]
+    assert response.json() == []
+
+
+def test_research_streams_events_and_saves_the_report(client):
+    events = research(client, "Acme Corp")
+    names = [event["event"] for event in events]
+
     assert names[0] == "research_started"
     assert names[-1] == "research_completed"
-    assert [data["section"] for name, data in events if name == "section_completed"] == [
-        "overview",
-        "key_people",
-        "news",
-        "financials",
-        "risks",
-    ]
+    assert "tool_call" in names and "section_delta" in names
 
-    report = events[-1][1]["report"]
-    history = client.get("/api/reports")
-    assert history.status_code == 200
-    assert history.json()[0]["company_name"] == "Test Company"
+    report = events[-1]["data"]["report"]
+    assert report["company_name"] == "Acme Corp"
+    assert report["overview"]
+    assert len(report["key_people"]) >= 1
 
-    stored = client.get(f"/api/reports/{report['id']}")
-    assert stored.status_code == 200
-    assert stored.json()["financials"]["market_cap"] is None
+    # It is retrievable afterwards, newest first in the list.
+    listed = client.get("/api/reports").json()
+    assert [item["company_name"] for item in listed] == ["Acme Corp"]
+
+    fetched = client.get(f"/api/reports/{report['id']}").json()
+    assert fetched["id"] == report["id"]
+    assert fetched["section_sources"]["overview"]
 
 
-def test_partial_section_failure_is_visible_and_saved(tmp_path: Any) -> None:
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'partial.db'}")
-    app = create_app(settings=settings, provider=FakeResearchProvider(failing_section="news"))
-
-    with TestClient(app) as test_client:
-        response = test_client.post("/api/research", json={"company_name": "Test Company"})
-        events = parse_sse(response.text)
-        names = [name for name, _ in events]
-
-        assert "section_failed" in names
-        assert names[-1] == "research_completed"
-        report = events[-1][1]["report"]
-        assert report["news"] is None
-        assert report["warnings"] == [
-            "Recent news is unavailable: The test provider could not load this section."
-        ]
+def test_event_ids_increase_monotonically(client):
+    with client.stream("POST", "/api/research", json={"company_name": "Acme Corp"}) as response:
+        body = response.read().decode()
+    ids = [int(line.removeprefix("id: ")) for line in body.split("\n") if line.startswith("id: ")]
+    assert ids == list(range(1, len(ids) + 1))
+    assert body.startswith("retry: ")
 
 
-def test_quota_failure_stops_without_repeating_all_sections(tmp_path: Any) -> None:
-    settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'quota.db'}",
-        gemini_quota_max_retries=0,
-    )
-    provider = QuotaLimitedProvider()
+def test_reports_can_be_deleted(client):
+    report = research(client, "Acme Corp")[-1]["data"]["report"]
 
-    with TestClient(create_app(settings=settings, provider=provider)) as test_client:
-        events = parse_sse(
-            test_client.post("/api/research", json={"company_name": "Test Company"}).text
-        )
-
-    assert [name for name, _ in events] == [
-        "research_started",
-        "section_started",
-        "research_failed",
-    ]
-    assert events[-1][1]["code"] == "rate_limited"
-    assert provider.calls == ["overview"]
+    assert client.delete(f"/api/reports/{report['id']}").status_code == 204
+    assert client.get(f"/api/reports/{report['id']}").status_code == 404
+    assert client.delete(f"/api/reports/{report['id']}").status_code == 404
+    assert client.get("/api/reports").json() == []
 
 
-def test_temporary_quota_limit_retries_and_completes(tmp_path: Any) -> None:
-    settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'retry.db'}",
-        gemini_quota_max_retries=1,
-        gemini_quota_retry_base_seconds=0,
-    )
-    provider = RetryOnceProvider()
-
-    with TestClient(create_app(settings=settings, provider=provider)) as test_client:
-        events = parse_sse(
-            test_client.post("/api/research", json={"company_name": "Test Company"}).text
-        )
-
-    names = [name for name, _ in events]
-    assert "section_retrying" in names
-    assert names[-1] == "research_completed"
-    assert provider.attempts["overview"] == 2
-
-
-def test_late_quota_limit_saves_partial_report_without_global_error(tmp_path: Any) -> None:
-    settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'late-quota.db'}",
-        gemini_quota_max_retries=0,
-    )
-
-    with TestClient(
-        create_app(settings=settings, provider=LateQuotaProvider())
-    ) as test_client:
-        events = parse_sse(
-            test_client.post("/api/research", json={"company_name": "Test Company"}).text
-        )
-
-    names = [name for name, _ in events]
-    assert "research_failed" not in names
-    assert names[-1] == "research_completed"
-    report = events[-1][1]["report"]
-    assert report["overview"] == SECTION_DATA["overview"]["overview"]
-    assert report["financials"] is None
-    assert report["risks"] is None
-    assert len(report["warnings"]) == 2
+def test_unknown_report_id_is_404_and_a_malformed_one_is_422(client):
+    assert client.get("/api/reports/11111111-1111-1111-1111-111111111111").status_code == 404
+    assert client.get("/api/reports/not-a-uuid").status_code == 422
 
 
 @pytest.mark.parametrize(
     "company_name",
-    ["x", "https://example.com", "hello@example.com", "1111"],
+    ["", " ", "a", "!!!!", "https://acme.com", "sales@acme.com", "aaaaa", "x" * 200],
 )
-def test_invalid_company_input_returns_422(client: TestClient, company_name: str) -> None:
+def test_gibberish_input_is_rejected_with_a_readable_message(client, company_name):
     response = client.post("/api/research", json={"company_name": company_name})
-
     assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert isinstance(detail, str) and detail
+    assert "Value error" not in detail
 
 
-def test_report_delete_uses_expected_status_codes(client: TestClient) -> None:
-    streamed = parse_sse(
-        client.post("/api/research", json={"company_name": "Test Company"}).text
+async def test_registry_admits_one_run_per_company_regardless_of_spelling():
+    registry = ActiveResearchRegistry()
+
+    assert await registry.acquire("Acme Corp") is True
+    assert await registry.acquire("  acme   CORP ") is False  # same company
+    assert await registry.acquire("Globex") is True  # different company
+
+    await registry.release("ACME corp")
+    assert await registry.acquire("Acme Corp") is True
+
+
+def test_a_second_run_for_the_same_company_is_rejected_with_409(client):
+    """The endpoint refuses before it opens a stream, so the user gets a status
+    code rather than a stream that immediately errors.
+
+    Both test transports buffer a streaming response to completion, so the
+    in-flight run is simulated by holding the lock the endpoint checks.
+    """
+    registry = client.app.state.research_registry
+    client.portal.call(registry.acquire, "Acme Corp")
+
+    duplicate = client.post("/api/research", json={"company_name": "  acme   CORP "})
+    assert duplicate.status_code == 409
+    assert "already being generated" in duplicate.json()["detail"]
+
+    # A different company is unaffected.
+    other = client.post("/api/research", json={"company_name": "Globex"})
+    assert other.status_code == 200
+
+
+def test_the_lock_is_released_once_the_stream_finishes(client):
+    research(client, "Acme Corp")
+    registry = client.app.state.research_registry
+    assert client.portal.call(registry.acquire, "Acme Corp") is True
+
+
+def test_a_provider_outage_becomes_a_research_failed_event_not_a_500(client, runtime):
+    from app.agent.search import SerpApiSearchClient
+
+    # Point the search client at a transport that always fails.
+    broken = SerpApiSearchClient(
+        api_key="k",
+        base_url="https://serpapi.com",
+        results_per_query=6,
+        country="us",
+        language="en",
+        connect_timeout=1.0,
+        read_timeout=1.0,
+        max_retries=0,
+        retry_base_seconds=0.0,
+        transport=httpx.MockTransport(lambda _: httpx.Response(503, json={})),
     )
-    report_id = streamed[-1][1]["report"]["id"]
+    runtime.agent._search = broken  # noqa: SLF001 - deliberate fault injection
 
-    assert client.delete(f"/api/reports/{report_id}").status_code == 204
-    assert client.get(f"/api/reports/{report_id}").status_code == 404
-    assert client.delete(f"/api/reports/{report_id}").status_code == 404
+    events = research(client, "Acme Corp")
+
+    assert events[-1]["event"] == "research_failed"
+    assert events[-1]["data"]["code"] == "no_evidence"
+    assert client.get("/api/reports").json() == []  # nothing half-written was saved
+
+
+def test_timestamps_are_serialised_with_a_utc_offset(client):
+    """SQLite returns naive datetimes; without an offset the browser reads
+    them as local time and shows a fresh briefing as hours old."""
+    report = research(client, "Acme Corp")[-1]["data"]["report"]
+    assert report["created_at"].endswith("Z") or "+00:00" in report["created_at"]
+
+    listed = client.get("/api/reports").json()[0]
+    assert listed["created_at"].endswith("Z") or "+00:00" in listed["created_at"]

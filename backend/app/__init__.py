@@ -1,1 +1,1 @@
-"""Briefd API package."""
+"""CompanyCue backend: a streaming company-research agent."""

@@ -1,74 +1,77 @@
-# Briefd
+# CompanyCue
 
-Briefd turns a company name into a sales briefing covering the company overview,
-key people, recent news, financials, and risks. Results stream to the browser and
-are saved locally in SQLite.
+CompanyCue creates a live, source-backed sales briefing from a company name. It
+searches the web, streams five report sections to the browser, and stores
+completed briefings locally.
 
-## Setup
+## What is implemented
 
-Prerequisites: Python 3.11+, Node.js 22.13+, and a Gemini API key.
+- Groq planning and synthesis using `openai/gpt-oss-20b` and
+  `openai/gpt-oss-120b`
+- SerpAPI Google web and news search
+- Streaming Server-Sent Events with progressive section rendering
+- Overview, key people, recent news, financials, and risks with source links
+- SQLite report history
+- Request cancellation, retry handling, search limits, and duplicate-run locks
+- Recorded mock providers for offline development and tests
 
-```sh
-make install
-cp .env.example .env
-# Set GEMINI_API_KEY in .env, then start both servers.
-make dev
-```
+## Stack
 
-- App: http://localhost:3000
-- API documentation: http://localhost:8000/docs
+- Backend: Python 3.11+, FastAPI, SQLAlchemy, SQLite, HTTPX
+- Frontend: Node 20.19+, React 19, TypeScript, Vite, Tailwind CSS
 
-The app starts without an API key, but research requests return a configuration
-error until a key is supplied.
+## Run locally
 
-## Configuration
-
-Backend settings are loaded from the root `.env` file. Keep credentials local;
-only placeholder `.env.example` files belong in source control.
-
-| Variable | Purpose |
-| --- | --- |
-| `GEMINI_API_KEY` | API key for company research. |
-| `GEMINI_MODEL` | Research model; choose one available to your API account. |
-| `GEMINI_FALLBACK_MODEL` | Optional fallback when the configured model is no longer available. |
-| `GEMINI_GOOGLE_SEARCH_ENABLED` | Enable Google Search grounding when supported by your account. Defaults to `false`. |
-| `GEMINI_QUOTA_MAX_RETRIES` | Number of retries for rate limits. Defaults to `2`. |
-| `GEMINI_QUOTA_RETRY_BASE_SECONDS` | Initial retry delay; doubles for each retry. Defaults to `20`. |
-| `DATABASE_URL` | Database connection string. Defaults to local SQLite. |
-| `CORS_ORIGINS` | JSON array of allowed frontend origins. Defaults to `["http://localhost:3000"]`. |
-
-To use a different backend address, copy `frontend/.env.example` to
-`frontend/.env.local` and set `NEXT_PUBLIC_API_URL`. This value is public browser
-configuration and must never contain credentials.
-
-Set `WATCH_POLLING=true` when starting the frontend if your environment requires
-polling for file changes.
-
-## Research behavior
-
-With search grounding enabled, Briefd requests each section separately and attaches
-available source links. Without grounding, it requests all five sections together;
-recent news and source links remain empty because no live search is performed.
-Unknown information is left empty rather than fabricated.
-
-## Development
+Install dependencies and create `.env`:
 
 ```sh
-make test   # Backend and frontend tests
-make check  # Tests, lint, and production build
+./scripts/setup.sh
 ```
 
-- `backend/app`: FastAPI routes, data models, persistence, and research provider.
-- `backend/tests`: API, streaming, retry, and provider tests.
-- `frontend/app`: Application routes, layout, and styles.
-- `frontend/components`: Briefing views and shared interface components.
-- `frontend/lib`: API client, stream decoder, and shared types.
+Add your provider keys to `.env`:
 
-## Limitations
+```env
+GROQ_API_KEY=your_groq_key
+SERPAPI_API_KEY=your_serpapi_key
+MOCK_PROVIDERS=false
+```
 
-Duplicate-research locking is limited to one API process. SQLite tables are created
-at startup; schema migrations and shared locking would be needed for a multi-worker
-service. Source links are attached per section rather than per claim.
+Start the API and frontend:
 
-The default setup runs locally without authentication. Database files, environment
-files, logs, and build output are excluded from source control.
+```sh
+./scripts/dev.sh
+```
+
+- App: <http://localhost:5173>
+- API docs: <http://localhost:8000/docs>
+
+To run without provider keys, set `MOCK_PROVIDERS=true` in `.env`.
+
+## Tests and build
+
+```sh
+./scripts/test.sh
+npm --prefix frontend run build
+```
+
+The test suites use recorded provider responses and do not require network
+access or API keys.
+
+## Project layout
+
+```text
+backend/app/       FastAPI routes, persistence, SSE, and research agent
+backend/tests/     Backend unit and integration tests
+frontend/src/      React application
+frontend/tests/    Frontend tests
+scripts/           Setup, development, and test commands
+.env.example       Configuration reference
+```
+
+## Main API routes
+
+- `POST /api/research` — stream a new briefing
+- `GET /api/reports` — list saved briefings
+- `GET /api/reports/{id}` — get one briefing
+- `DELETE /api/reports/{id}` — delete one briefing
+- `GET /api/health` — show provider configuration status
